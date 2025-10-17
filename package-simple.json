@@ -1,0 +1,12 @@
+{
+  "name": "@machinehack/backend-simple",
+  "version": "1.0.0",
+  "description": "Simple MachineHack Backend API",
+  "main": "api/simple.js",
+  "scripts": {
+    "vercel-build": "echo 'No build step required'"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  }
+}
