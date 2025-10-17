@@ -15,40 +15,85 @@ app.use('*', cors({
   credentials: true,
 }));
 
-// Real Turso database connection
+// Database connection with fallback
 let db = null;
+let useInMemory = false;
+let inMemoryData = [];
 
 const getDatabase = async () => {
   if (!db) {
     try {
-      db = createClient({
-        url: process.env.DATABASE_URL || 'libsql://test-makraj24.aws-ap-south-1.turso.io',
-        authToken: process.env.TURSO_AUTH_TOKEN // Add this to your env vars
-      });
-      
-      // Initialize database schema
-      await db.execute(`
-        CREATE TABLE IF NOT EXISTS submissions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          username TEXT NOT NULL,
-          score REAL NOT NULL,
-          feedback TEXT NOT NULL,
-          file_name TEXT NOT NULL,
-          file_size INTEGER NOT NULL,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-      
-      // Create index for leaderboard queries
-      await db.execute(`
-        CREATE INDEX IF NOT EXISTS idx_submissions_score 
-        ON submissions(score DESC, created_at ASC)
-      `);
-      
-      console.log('Database connected successfully');
+      // Try Turso database first
+      if (process.env.DATABASE_URL && process.env.TURSO_AUTH_TOKEN) {
+        db = createClient({
+          url: process.env.DATABASE_URL,
+          authToken: process.env.TURSO_AUTH_TOKEN
+        });
+        
+        // Initialize database schema
+        await db.execute(`
+          CREATE TABLE IF NOT EXISTS submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            score REAL NOT NULL,
+            feedback TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          )
+        `);
+        
+        // Create index for leaderboard queries
+        await db.execute(`
+          CREATE INDEX IF NOT EXISTS idx_submissions_score 
+          ON submissions(score DESC, created_at ASC)
+        `);
+        
+        console.log('Turso database connected successfully');
+      } else {
+        throw new Error('Turso credentials not available');
+      }
     } catch (error) {
-      console.error('Database connection failed:', error);
-      throw error;
+      console.error('Turso database connection failed, using in-memory fallback:', error.message);
+      useInMemory = true;
+      
+      // Create in-memory database interface
+      db = {
+        async execute(query, params = []) {
+          if (query.includes('CREATE TABLE')) {
+            return { changes: 0 };
+          }
+          if (query.includes('CREATE INDEX')) {
+            return { changes: 0 };
+          }
+          if (query.includes('INSERT INTO')) {
+            const id = inMemoryData.length + 1;
+            const submission = {
+              id,
+              username: params[0],
+              score: params[1],
+              feedback: params[2],
+              file_name: params[3],
+              file_size: params[4],
+              created_at: new Date().toISOString()
+            };
+            inMemoryData.push(submission);
+            return { lastID: id, changes: 1 };
+          }
+          if (query.includes('SELECT') && query.includes('ORDER BY score DESC')) {
+            return inMemoryData
+              .sort((a, b) => b.score - a.score)
+              .slice(0, 10);
+          }
+          if (query.includes('SELECT') && query.includes('WHERE id =')) {
+            const id = parseInt(params[0]);
+            return inMemoryData.find(item => item.id === id) || null;
+          }
+          return [];
+        }
+      };
+      
+      console.log('In-memory database initialized as fallback');
     }
   }
   return db;
