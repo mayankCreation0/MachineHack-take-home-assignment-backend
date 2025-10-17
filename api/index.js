@@ -2,6 +2,7 @@ const { Hono } = require('hono');
 const { cors } = require('hono/cors');
 const dotenv = require('dotenv');
 const { z } = require('zod');
+const { createClient } = require('@libsql/client');
 
 // Load environment variables
 dotenv.config();
@@ -14,33 +15,43 @@ app.use('*', cors({
   credentials: true,
 }));
 
-// Simple in-memory database for Vercel
-let submissions = [];
-let nextId = 1;
+// Real Turso database connection
+let db = null;
 
-// Mock database functions
-const getDatabase = () => {
-  return {
-    async run(query, params = []) {
-      const id = nextId++;
-      submissions.push({
-        id,
-        username: params[0] || 'unknown',
-        score: params[1] || 0,
-        feedback: params[2] || 'No feedback',
-        file_name: params[3] || 'unknown.csv',
-        file_size: params[4] || 0,
-        created_at: new Date().toISOString()
+const getDatabase = async () => {
+  if (!db) {
+    try {
+      db = createClient({
+        url: process.env.DATABASE_URL || 'libsql://test-makraj24.aws-ap-south-1.turso.io',
+        authToken: process.env.TURSO_AUTH_TOKEN // Add this to your env vars
       });
-      return { lastID: id };
-    },
-    async get(query, params = []) {
-      return submissions.find(s => s.id === parseInt(params[0])) || null;
-    },
-    async all(query, params = []) {
-      return submissions.sort((a, b) => b.score - a.score).slice(0, 10);
+      
+      // Initialize database schema
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS submissions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT NOT NULL,
+          score REAL NOT NULL,
+          feedback TEXT NOT NULL,
+          file_name TEXT NOT NULL,
+          file_size INTEGER NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      
+      // Create index for leaderboard queries
+      await db.execute(`
+        CREATE INDEX IF NOT EXISTS idx_submissions_score 
+        ON submissions(score DESC, created_at ASC)
+      `);
+      
+      console.log('Database connected successfully');
+    } catch (error) {
+      console.error('Database connection failed:', error);
+      throw error;
     }
-  };
+  }
+  return db;
 };
 
 // Real AI Service with Gemini Integration
@@ -288,16 +299,16 @@ app.post('/api/submissions', async (c) => {
     );
 
     // Save to database
-    const db = getDatabase();
-    const result = await db.run(
-      'INSERT INTO submissions (username, score, feedback, file_name, file_size, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [username, scoringResult.score, feedback, file.name, file.size, new Date().toISOString()]
-    );
+    const database = await getDatabase();
+    const result = await database.execute({
+      sql: 'INSERT INTO submissions (username, score, feedback, file_name, file_size, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      args: [username, scoringResult.score, feedback, file.name, file.size, new Date().toISOString()]
+    });
 
     return c.json({
       success: true,
       data: {
-        id: result.lastID,
+        id: result.lastInsertRowid,
         username,
         score: scoringResult.score,
         accuracy: scoringResult.accuracy,
@@ -321,12 +332,15 @@ app.post('/api/submissions', async (c) => {
 // GET /api/leaderboard - Get top 10 submissions
 app.get('/api/leaderboard', async (c) => {
   try {
-    const db = getDatabase();
-    const leaderboard = await db.all('SELECT * FROM submissions ORDER BY score DESC LIMIT 10');
+    const database = await getDatabase();
+    const result = await database.execute({
+      sql: 'SELECT id, username, score, feedback, file_name, created_at FROM submissions ORDER BY score DESC, created_at ASC LIMIT 10',
+      args: []
+    });
     
     return c.json({
       success: true,
-      data: leaderboard
+      data: result.rows
     });
   } catch (error) {
     console.error('Leaderboard error:', error);
@@ -341,10 +355,13 @@ app.get('/api/leaderboard', async (c) => {
 app.get('/api/submissions/:id', async (c) => {
   try {
     const id = parseInt(c.req.param('id'));
-    const db = getDatabase();
-    const submission = await db.get('SELECT * FROM submissions WHERE id = ?', [id]);
+    const database = await getDatabase();
+    const result = await database.execute({
+      sql: 'SELECT id, username, score, feedback, file_name, created_at FROM submissions WHERE id = ?',
+      args: [id]
+    });
     
-    if (!submission) {
+    if (result.rows.length === 0) {
       return c.json({
         success: false,
         error: 'Submission not found'
@@ -353,7 +370,7 @@ app.get('/api/submissions/:id', async (c) => {
 
     return c.json({
       success: true,
-      data: submission
+      data: result.rows[0]
     });
   } catch (error) {
     console.error('Get submission error:', error);
